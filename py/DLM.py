@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.special import factorial # fix this at some point
+from scipy.linalg import block_diag
+from collections import namedtuple
 
 #
 class DLM_ParticleTool():
@@ -57,8 +59,8 @@ class DLM_Class():
     # allocate/declare matrices and vectors
     def __init__(self, n, r, D=np.float64): # n = state dim, r = observation dim
         self.m = np.zeros(n, dtype=D) # state (n x 1)
-        self.a = np.zeros(n, dtype=D) # prediction (n x 1) of the next state
-        self.f = np.zeros(r, dtype=D) # forecast (r x 1)
+        self.a = np.zeros(n, dtype=D) # prediction (n x 1), state
+        self.f = np.zeros(r, dtype=D) # forecast (r x 1), measurement
         self.C = np.eye(n, dtype=D) # posterior covariance
         self.R = np.zeros([n, n], dtype=D) # prediction covariance
         self.Q = np.zeros([r, r], dtype=D) # forecast covariance
@@ -69,28 +71,160 @@ class DLM_Class():
         self.W = np.eye(n, dtype=D) # evolution covariance
         self._n = n
         self._r = r
+        self.RF = np.zeros([n, r], dtype=D) # R.dot(F) (n x r)
+
+    # public methods    
+    def init_State(self, m):
+        self.m[:] = m[:]
+    def init_State_Covar(self, C):
+        self.C[:,:] = C[:,:]
+    def init_Evolution_Matrix(self, G):
+        self.G[:,:] = G[:,:]
+    def init_Design_Matrix(self, F):
+        self.F[:,:] = F[:,:]
+    def init_Evolution_Covar(self, W):
+        self.W[:,:] = W[:,:]
+    def init_Measurement_Covar(self, V):
+        self.V[:,:] = V[:,:]
+
+    def get_State(self):
+        return self.m[:] 
+    def get_Covar(self):
+        return self.C[:,:]
     
-    # use when both models are linear (evolution and observation)
-    def iterate_DLM(self, Yt):
-        self.a[:] = np.dot( self.G, self.m )
-        self.R[:,:] = np.dot(self.G, np.dot(self.C, self.G.T)) + self.W
-        self.f[:] = np.dot( self.F.T, self.a )
-        self.Q[:,:] = np.dot(self.F.T, np.dot(self.R, self.F)) + self.V
-        self.A[:,:] = np.array( np.dot(self.R, np.dot(self.F, np.matrix(self.Q).I)) )
-        self.m[:] = self.a + np.dot( self.A, Yt-self.f )
-        self.C[:,:] = np.dot( self.R, np.eye(self._n) - np.dot(self.F, self.A.T) )
+    def iterate(self, Yt):
+        self.a[:]   = self.map_State(self.m)
+        self.G[:,:] = self.jacobi_State(self.m)
+        self.R[:,:] = self.evaluate_R(self.G, self.C, self.W)
+        self.f[:]   = self.map_Measurement(self.a)
+        self.F[:,:] = self.jacobi_Measurement(self.a)
+        self.Q[:,:] = self.evaluate_Q(self.F, self.R, self.V)
+        self.A[:,:] = self.evaluate_A(self.R, self.F, self.Q)
+        self.m[:]   = self.a + self.A.dot(Yt - self.f) # master equation
+        self.C[:,:] = self.evaluate_C(self.R, self.F, self.A)
         return
     
-    # use when observation model is non-linear (but evolution is linear)
-    def iterate_DnLM(self, Yt, evaluateF, jacobiF):
-        self.a[:] = np.dot( self.G, self.m )
-        self.R[:,:] = np.dot(self.G, np.dot(self.C, self.G.T)) + self.W
-        self.f[:] = evaluateF(self.a) # nonlinear mapping in replace of F.T (from n to r variables)
-        J = jacobiF(self.a) # (r x n), J plays the role of F.T (not F)
-        self.Q[:,:] = np.dot(J, np.dot(self.R, J.T)) + self.V
-        self.A[:,:] = np.array( np.dot(self.R, np.dot(J.T, np.matrix(self.Q).I)) )
-        self.m[:] = self.a + np.dot( self.A, Yt-self.f )
-        self.C[:,:] = np.dot( self.R, np.eye(self._n) - np.dot(J.T, self.A.T) )
+    # protected methods (override when necessary, e.g. for computational efficiency)
+    def map_State(self, m):
+        return self.G.dot(m)
+        
+    def jacobi_State(self, m):
+        return self.G
+    
+    def map_Measurement(self, a):
+        return self.F.T.dot(a)
+        
+    def jacobi_Measurement(self, a):
+        return self.F
+    
+    def evaluate_R(self, G, C, W):
+        return G.dot(C.dot(G.T)) + W
+    
+    def evaluate_Q(self, F, R, V):
+        #self.RF[:,:] = R.dot(F)
+        #return F.T.dot(self.RF) + V
+        return F.T.dot(R.dot(F)) + V
+    
+    def evaluate_A(self, R, F, Q):
+        #return self.RF.dot(np.matrix(self.Q).I))
+        return R.dot(F.dot(np.matrix(self.Q).I))
+    
+    def evaluate_C(self, R, F, A):
+        #return R - self.RF.dot(A.T)
+        return R.dot(np.eye(self._n) - F.dot(A.T))
+    
+    def forecast(self, k): # f_t(k) = E[ Y_{t+k} | y_{1:t} ]
+        G_power_k = self.G[:,:]
+        for i in range(max(0,k-1)):
+            G_power_k.dot(self.G)
+        return self.F.T.dot(G_power_k.dot(self.m))
+
+
+#
+SigmaEvolutionTuple = namedtuple('SigmaEvolutionTuple', 
+                                 ['level','harmonic','obs_noise'], defaults=3*[1e-1])
+
+class Local_Level_Single_Harmonic_DLM(DLM_Class):
+    """
+    Doc Bak's use case
+    Local level with a zero-mean harmonic component on top
+    Thus, the latent evolution model has 3 time-varying parameters (n=3)
+    The discrete period p is considered fixed, i.e. it's not a dynamic parameter
+    """
+    def __init__(self, p, _lambda=1., sigma=SigmaEvolutionTuple()):
+        DLM_Class.__init__(self, n=1+2, r=1)
+
+        self._p = p
+        self._lambda = _lambda
+        self._sigma = sigma
+        self._omega = 2.*np.pi*(1./p) # convert period p to discrete frequency
+        cos, sin = np.cos(self._omega), np.sin(self._omega)
+        
+        G1 = np.eye(1)                  # 1x1
+        W1 = np.eye(1) * sigma.level**2 # 1x1
+        G2 = self._lambda * np.array([[cos,sin],[-sin,cos]]) # 2x2 rotation matrix
+        W2 = np.eye(2) * sigma.harmonic**2                   # 2x2
+        
+        self.init_Evolution_Matrix( block_diag(G1,G2) ) # 3x3
+        self.init_Design_Matrix( np.c_[1.,1.,0.].T )    # 3x1
+        self.init_Evolution_Covar( block_diag(W1,W2) )  # 3x3
+        self.init_Measurement_Covar(np.c_[sigma.obs_noise**2]) # scalar
         return
+
+    def forecast(self, k): # override implementation in base class
+        level = self.m[0]
+        cos_part = self.m[1] * np.cos(k*self._omega)
+        sin_part = self.m[2] * np.sin(k*self._omega)
+        return level + (cos_part + sin_part) * self._lambda**k
+
+#
+class Polynomial_Trend_DLM(DLM_Class):
+    def __init__(self, n):
+        DLM_Class.__init__(self, n, 1)
+        
+        G = np.eye(n)
+        for i in range(n-1):
+            G[i,i+1] = 1.
+        self.init_Evolution_Matrix(G)
+        
+        self.F[:] = 0.
+        self.F[0] = 1.
+        # MLJA, need to implement the rest at some point
+
+#
+class Harmonic_Component_DLM(DLM_Class):
+    def __init__(self, p, _lambda=1.): # [W&H] Sec. 5.5.4, 6.1.2, 8.6.3
+        DLM_Class.__init__(self, 2, 1)
+        
+        self._lambda = _lambda
+        self._omega = 2.*np.pi*(1./p)
+        cos, sin = np.cos(omega), np.sin(self._omega)
+        G = self._lambda * np.array([[cos,sin],[-sin,cos]])
+        self.init_Evolution_Matrix(G)
+        
+        self.F[:] = 0.
+        self.F[0] = 1.
+        # MLJA, need to implement the rest at some point
+
+#
+class Form_Free_Seasonal_DLM(DLM_Class):
+    def __init__(self, p): # [W&H] Sec. 8.3, 8.4 and 8.5
+        DLM_Class.__init__(self, n=p, r=1)
+        
+        G = np.roll(np.eye(n), shift=1, axis=0) # pop rotation
+        self.init_Evolution_Matrix(G)
+        # MLJA, need to implement the rest at some point
+
+#
+class Fourier_Form_Seasonal_DLM(DLM_Class):
+    def __init__(self, p): # [W&H] Sec. 8.6
+        DLM_Class.__init__(self, n=p, r=1)
+        # MLJA, need to implement the rest at some point
+
+#
+class ARMA_DLM(DLM_Class):
+    def __init__(self, p, q): # [W&H] Sec. 9.4.6
+        DLM_Class.__init__(self, n=max(p,q+1), r=1)        
+        # MLJA, need to implement the rest at some point
 
 #
